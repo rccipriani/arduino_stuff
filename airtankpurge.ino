@@ -1,3 +1,7 @@
+//will activate compressor purge solenoid for 10 seconds every 24 hours
+//button will purge on demand
+//button may need debounce logic
+
 unsigned long interval = 86400000; //24 hours
 int purgeTime = 10000; //10 seconds
 unsigned long previousMillis = 0;
@@ -17,7 +21,7 @@ void setup() {
 
 void loop()
 {
-  unsigned long currentMillis = millis();
+  unsigned long currentMillis = millis(); //millis() returns the number of milliseconds the Arduino has been running. What happens when this reaches the max?
 
   if (currentMillis - previousMillis > interval) {
     previousMillis = currentMillis;
@@ -26,7 +30,8 @@ void loop()
 
   if (digitalRead(1) == LOW) {
     purge();
-  }
+    previousMillis = currentMillis; //on manual purge, start the 24 hour timer from "now"
+ }
 
 }
 
