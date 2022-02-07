@@ -21,7 +21,7 @@ void setup() {
 
 void loop()
 {
-  unsigned long currentMillis = millis(); //millis() returns the number of milliseconds the Arduino has been running. What happens when this reaches the max?
+  unsigned long currentMillis = millis(); //millis() returns the number of milliseconds the Arduino has been running. Resets to 0 after approx 50 days.
 
   if (currentMillis - previousMillis > interval) {
     previousMillis = currentMillis;
