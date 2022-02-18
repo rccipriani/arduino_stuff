@@ -10,7 +10,7 @@ static unsigned long int hoursToMs = 3600000;
 
 unsigned long interval = 24 * hoursToMs;
 int purgeTime = 5000; //5 seconds
-  int loopDelay = 250; //250 ms
+int loopDelay = 250; //250 ms
 unsigned long previousMillis = 0;
 
 void setup() {
