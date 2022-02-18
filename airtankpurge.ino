@@ -1,4 +1,4 @@
-//v1.0.1
+//v1.0.2
 
 //will activate compressor purge solenoid for ~10 seconds every 24 hours
 //button will purge on demand
@@ -10,6 +10,7 @@ static unsigned long int hoursToMs = 3600000;
 
 unsigned long interval = 24 * hoursToMs;
 int purgeTime = 5000; //5 seconds
+  int loopDelay = 250; //250 ms
 unsigned long previousMillis = 0;
 
 void setup() {
@@ -41,6 +42,8 @@ void loop()
     previousMillis = currentMillis; //on manual purge, start the 24 hour timer from "now"
   }
 
+  //adding a delay here, it seemed the loop was running so frequently that it was picking up the switch press multiple times
+  delay(loopDelay);
 }
 
 
