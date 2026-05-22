@@ -1,59 +1,98 @@
-//v1.0.4
+// v1.0.5
 
-//will activate compressor purge solenoid for ~5 seconds every 24 hours
-//button will purge on demand
-//using an ASCO 1/4" 8262H022-12/DC solenoid valve
+// Automatic compressor purge every 24 hours
+// Manual button purges on demand
+// Using ASCO 1/4" 8262H022-12/DC solenoid valve
+// Arduino UNO or Nano
+// Relay: Omron G2R-1-S DC12(S) 
+// 12v power for solenoid soldered directly to Arduino's input jack, with power switched through relay terminals
+//
+// Assumptions:
+// - Relay input is active HIGH
+// - Button uses INPUT_PULLUP
+// - Button pressed = LOW
+// - Startup test intentionally resets the 24-hour timer
 
-static unsigned long int hoursToMs = 3600000;  //conversion factor for hours to milliseconds
-unsigned long interval = 24 * hoursToMs; //interval between automatic purges in hours
-int purgeTime = 5000; //5 seconds
-int loopDelay = 250; //250 ms
-unsigned long previousMillis = 0; //millis() count for last purge
-int switchRead = 0; //flag for first switch read
+const byte RELAY_PIN = 7;
+const byte BUTTON_PIN = 8;
 
-void setup() {
-  interrupts(); //should be on by default, needed for millis()
+const unsigned long HOURS_TO_MS   = 3600000UL; //conversion factor for hours to milliseconds
+const unsigned long INTERVAL_MS   = 24UL * HOURS_TO_MS; //interval between automatic purges in hours
+const unsigned long PURGE_TIME_MS = 5000UL; //5 seconds
+const unsigned long DEBOUNCE_MS   = 50UL;
 
-  pinMode(0, OUTPUT); //RELAY CONTROL
-  pinMode(1, INPUT_PULLUP);  //MANUAL BUTTON, PRESSED=LOW
+unsigned long previousPurgeMillis = 0;
+unsigned long lastButtonChangeMillis = 0;
 
-  //test
-  digitalWrite(0, HIGH);
-  delay(1000); //1 seconds
+bool lastButtonReading = HIGH;
+bool stableButtonState = HIGH;
 
-  //reset
-  digitalWrite(0, LOW);
+void setup()
+{
+    pinMode(RELAY_PIN, OUTPUT); //RELAY CONTROL
+    pinMode(BUTTON_PIN, INPUT_PULLUP);  //MANUAL BUTTON, PRESSED = LOW
 
+    // Ensure relay starts OFF
+    digitalWrite(RELAY_PIN, LOW);
+
+    // Startup functional test
+    // NOTE:
+    // This intentionally occurs on every power-up/reset
+    // and resets the 24-hour purge schedule
+
+    digitalWrite(RELAY_PIN, HIGH);
+    delay(1000);      // 1 second test
+    digitalWrite(RELAY_PIN, LOW);
+
+    // Start timer after startup test
+    previousPurgeMillis = millis();
 }
 
 void loop()
 {
   unsigned long currentMillis = millis(); //millis() returns the number of milliseconds the Arduino has been running. Loops back to 0 after about 50 days
 
-  if (currentMillis - previousMillis > interval) {
-    previousMillis = currentMillis;
-    purge();
-  }
+    // Automatic purge timer
+    if (currentMillis - previousPurgeMillis >= INTERVAL_MS)
+    {
+        purge();
+        previousPurgeMillis = millis();
+    }
 
-  if (digitalRead(1) == LOW) {
-    switchRead = 1;
-    purge();
-    previousMillis = currentMillis; //on manual purge, start the 24 hour timer from "now"
-  }
+    // Manual button handling with debounce
+    bool reading = digitalRead(BUTTON_PIN);
 
-  //adding a delay here, it seemed the loop was running so frequently that it was picking up the switch press multiple times
-  if (switchRead == 1) {
-    delay(loopDelay);
-    switchRead = 0;
-  }
+    // Detect state change
+    if (reading != lastButtonReading)
+    {
+        lastButtonChangeMillis = currentMillis;
+        lastButtonReading = reading;
+    }
+
+    // If stable longer than debounce period
+    if ((currentMillis - lastButtonChangeMillis) >= DEBOUNCE_MS)
+    {
+        if (reading != stableButtonState)
+        {
+            stableButtonState = reading;
+
+            // Trigger once when button is pressed
+            if (stableButtonState == LOW)
+            {
+                purge();
+
+                // Restart 24-hour timer from manual purge
+                previousPurgeMillis = millis();
+            }
+        }
+    }
 }
-
 
 void purge()
 {
-  digitalWrite(0, HIGH);
-  delay(purgeTime);
-  digitalWrite(0, LOW);
-  //adding a delay   
-  delay(5000);
+    digitalWrite(RELAY_PIN, HIGH);
+
+    delay(PURGE_TIME_MS);
+
+    digitalWrite(RELAY_PIN, LOW);
 }
