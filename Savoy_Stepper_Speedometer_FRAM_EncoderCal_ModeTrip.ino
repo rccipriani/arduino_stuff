@@ -1,10 +1,13 @@
 /*
 Stepper Motor Speedometer and OLED Odometer
-Robert Cipriani May 2024
--- Modified for SPI OLED 256x64
--- Added logic for calibration harness with rotary encoder and pushbutton
--- Added display mode / trip reset pushbutton
--- Moved from EEPROM to FRAM and removed transmission "neutral" signal
+Robert Cipriani May 2026
+-- Modified for SPI OLED 256x64 SH1122
+-- Uses FRAM for odometer/trip/ratio storage
+-- Uses rotary encoder calibration harness
+-- Mode/trip button: ODO -> TRIP -> MPH -> RATIO -> RPM
+-- Calibration harness overrides the selected mode and displays MPH + RATIO
+-- Adds display viewport constants for factory odometer-window alignment
+-- Adds alignment/test display support
 
 Credits:
 Luke Hurst for the bulk of this Sketch https://retromini.weebly.com/blog/arduino-speedometer
@@ -15,52 +18,88 @@ PJRC for the FreqMeasure library - https://www.pjrc.com/teensy/td_libs_FreqMeasu
 Trewjohn2001 for the Odometer code - http://www.mgexp.com/phorum/read.php?40,2761694
 */
 
+#include <Arduino.h>
+#include <SPI.h>
+#include <Wire.h>
 #include <Adafruit_FRAM_I2C.h>
 #include "SwitecX25.h"
 #include "FreqMeasure.h"
-#include <SPI.h>
-#include <Arduino.h>
 #include <U8g2lib.h>
-#include <math.h>
 
-//----Define OLED Display Settings------
-//U8G2_SH1122_256X64_2_4W_SW_SPI display(U8G2_R0, /* clock=*/ 13, /* data=*/ 11, /* cs=*/ 10, /* dc=*/ 9, /* reset=*/ 8);        // Enable U8G2_16BIT in u8g2.h ?
-// 2 pages in memory, hardware SPI, no rotations
-U8G2_SH1122_256X64_2_4W_HW_SPI display(U8G2_R0,  /* cs=*/ 10, /* dc=*/ 9, /* reset=*/ 8);        // Enable U8G2_16BIT in u8g2.h ?
-//hw: data 11, clock 13
-//-----End OLED Display Settings--------
+// -----------------------------------------------------------------------------
+// Build options
+// -----------------------------------------------------------------------------
+#define DEBUG_SERIAL 1
+#define SHOW_ALIGNMENT_ON_STARTUP 0  // set to 1 to show 88888.8 after logo for fitting the OLED
 
-Adafruit_FRAM_I2C fram = Adafruit_FRAM_I2C(); // instantiate and initialize FRAM
+// -----------------------------------------------------------------------------
+// OLED Display Settings
+// -----------------------------------------------------------------------------
+// Real hardware display from original sketch:
+//   SH1122 256x64 4-wire SPI OLED
+//   Hardware SPI on Nano: MOSI D11, SCK D13
+//   CS D10, DC D9, RESET D8
+//   Enable U8G2_16BIT in u8g2.h if required by this display.
+U8G2_SH1122_256X64_2_4W_HW_SPI display(U8G2_R0, /* cs=*/ 10, /* dc=*/ 9, /* reset=*/ 8);
 
-/* Connect SCL    to analog 5
-   Connect SDA    to analog 4
-   Connect VDD    to 5.0V DC
-   Connect GROUND to common ground */
+// Factory odometer-window viewport/alignment constants.
+// Adjust these after the OLED is physically positioned behind the gauge face.
+const int VIEW_X = 5;
+const int VIEW_Y = 38;
+const int VIEW_W = 130;
+const int VIEW_H = 24;
 
-const int UpdateInterval = 100;   // 100 milliseconds speedo update rate
-const int UpdateInterval2 = 1000; // 1000 milliseconds odometer/display update rate
-const double StepsPerDegree = 3.0;  // Motor step is 1/3 of a degree of rotation
-const unsigned int MaxMotorRotation = 170; // 170 max degrees of movement **need to compare to actual speedometer**
+// -----------------------------------------------------------------------------
+// FRAM
+// -----------------------------------------------------------------------------
+Adafruit_FRAM_I2C fram = Adafruit_FRAM_I2C();
+const unsigned long framAddr = 0x50;
+
+// FRAM address map
+const uint16_t ADDR_TRIP_TENTHS = 0x00;
+const uint16_t ADDR_TRIP_ONES = 0x01;
+const uint16_t ADDR_TRIP_TENS = 0x02;
+const uint16_t ADDR_TRIP_HUNDREDS = 0x03;
+
+const uint16_t ADDR_ODO_TENTHS = 0x04;
+const uint16_t ADDR_ODO_ONES = 0x05;
+const uint16_t ADDR_ODO_TENS = 0x06;
+const uint16_t ADDR_ODO_HUNDREDS = 0x07;
+const uint16_t ADDR_ODO_THOUSANDS = 0x08;
+const uint16_t ADDR_ODO_TEN_THOUSANDS = 0x09;
+const uint16_t ADDR_ODO_HUNDRED_THOUSANDS = 0x0A;
+
+const uint16_t ADDR_RATIO = 0x20;
+
+// -----------------------------------------------------------------------------
+// Speedometer constants
+// -----------------------------------------------------------------------------
+const int UpdateInterval = 100;      // 100 milliseconds speedo update rate
+const int UpdateInterval2 = 1000;    // 1 second odometer/display update rate
+const double StepsPerDegree = 3.0;   // Motor step is 1/3 of a degree of rotation
+const unsigned int MaxMotorRotation = 170; // 170 max degrees of movement; compare to actual speedometer
 const unsigned int MaxMotorSteps = MaxMotorRotation * StepsPerDegree;
 const double PulsesPerMile = 4000.0; // Number of input pulses per mile
 const double SecondsPerHour = 3600.0;
-const int FeetPerMile = 5280; // Feet per mile conversion factor for Odometer update function
-const double SpeedoDegreesPerMPH = 170.0 / 100.0; // Speed on face of dial at 180 degrees is 110 (?) mph.
+const int FeetPerMile = 5280;
+const double SpeedoDegreesPerMPH = 170.0 / 100.0; // 100 MPH at 170 degrees
 
-unsigned long PreviousMillis = 0;   // last time we updated the speedo
+unsigned long PreviousMillis = 0;
 unsigned long PreviousMillis2 = 0;
-double MinMotorStep;  // lowest step that will be used - calculated from update interval
-unsigned long distsubtotal = 0;     // Running total of feet covered for main odometer update function
-unsigned long tripsubtotal = 0;     // Running total of feet covered for trip odometer update function
-unsigned long FeetTravelled = 0;    // mph converted into feet travelled for Odometer function
+double MinMotorStep = 0;
+unsigned long distsubtotalFeetTenths = 0; // tenths of a foot accumulator
+
 double sum = 0;
 int count = 0;
 double avgPulseLength = 0;
 unsigned int motorStep = 0;
 int noInputCount = 0;
-float mph = 0;
+float mph = 0.0;
+float rpm = 0.0; // future placeholder
 
-// variables for calibration ratio storage
+// -----------------------------------------------------------------------------
+// Calibration ratio
+// -----------------------------------------------------------------------------
 union RatioUnion
 {
   float f;
@@ -69,85 +108,79 @@ union RatioUnion
 
 RatioUnion ratio;
 
-//----Calibration harness / encoder pin outs-------------------------------------------
-// Harness detect is active LOW. When the calibration harness is plugged in, connect CAL_DETECT_PIN to GND.
-const int CAL_DETECT_PIN = A0;     // A0 is also digital pin 14 on an Arduino Uno/Nano style board
-const int ENCODER_A_PIN = 3;       // Encoder channel A. Avoid D2 because FreqMeasure uses the pulse input.
-const int ENCODER_B_PIN = 12;      // Encoder channel B. If D12 conflicts with your SPI/OLED wiring, move this pin.
-const int ENCODER_BUTTON_PIN = A1; // Encoder pushbutton, active LOW. Short press saves; long press resets ratio to 1.000.
-
-//----Display mode / trip reset button-------------------------------------------------
-// Active LOW. Short press cycles display modes. Long press resets trip odometer only when the trip screen is active.
-const int MODE_BUTTON_PIN = A2;
-
-enum DisplayMode
-{
-  MODE_ODOMETER = 0,
-  MODE_TRIP = 1,
-  MODE_RATIO = 2,
-  MODE_RPM = 3,        // Placeholder for future tach/RPM input.
-  MODE_COUNT = 4
-};
-
-DisplayMode displayMode = MODE_ODOMETER;
-
-const float DEFAULT_RATIO = 1.000;
-const float MIN_RATIO = 0.500;
-const float MAX_RATIO = 2.000;
-const float RATIO_STEP = 0.001; // One encoder detent changes ratio by 0.1% if your encoder outputs one detent per counted step.
-
-bool calibrationMode = false;
-int lastEncoderA = HIGH;
-unsigned long lastEncoderMoveMillis = 0;
-unsigned long encoderButtonLastChangeMillis = 0;
-unsigned long encoderButtonPressedMillis = 0;
-bool encoderButtonLastReading = HIGH;
-bool encoderButtonState = HIGH;
+const float DefaultRatio = 1.000;
+const float MinRatio = 0.500;
+const float MaxRatio = 2.000;
+const float RatioStep = 0.001;
+const unsigned long EncoderSaveIntervalMs = 1000;
+unsigned long lastRatioChangeMillis = 0;
 bool ratioDirty = false;
 
-unsigned long modeButtonLastChangeMillis = 0;
-unsigned long modeButtonPressedMillis = 0;
+// -----------------------------------------------------------------------------
+// Pins
+// -----------------------------------------------------------------------------
+// FreqMeasure on ATmega328P/Nano uses digital pin 8 for input capture on many boards,
+// but the original sketch used pin 2 with FreqMeasure.begin(). Confirm your actual
+// FreqMeasure board/pin mapping before wiring final hardware.
+const uint8_t speedPulsePin = 2;
+
+// Stepper motor pins
+SwitecX25 Motor(MaxMotorSteps, 4, 5, 6, 7);
+
+// Calibration harness detect: A0/D14 to GND when calibration harness is plugged in.
+const uint8_t calSwitchPin = A0;
+
+// Rotary encoder calibration harness:
+//   CLK/A -> D3
+//   DT/B  -> D12
+//   SW    -> A1
+//   +     -> 5V
+//   GND   -> GND
+const uint8_t encoderAPin = 3;
+const uint8_t encoderBPin = 12;
+const uint8_t encoderButtonPin = A1;
+
+// Mode/trip button:
+//   A2 -> pushbutton -> GND
+const uint8_t modeButtonPin = A2;
+
+int lastEncoderA = HIGH;
+
+// Button timing
+const unsigned long DebounceMs = 35;
+const unsigned long LongPressMs = 1000;
+
+bool encButtonLastReading = HIGH;
+bool encButtonStableState = HIGH;
+unsigned long encButtonLastChange = 0;
+unsigned long encButtonPressedAt = 0;
+bool encLongPressHandled = false;
+
 bool modeButtonLastReading = HIGH;
-bool modeButtonState = HIGH;
-bool modeButtonLongPressHandled = false;
+bool modeButtonStableState = HIGH;
+unsigned long modeButtonLastChange = 0;
+unsigned long modeButtonPressedAt = 0;
+bool modeLongPressHandled = false;
 
-const unsigned long ENCODER_DEBOUNCE_MS = 2;
-const unsigned long BUTTON_DEBOUNCE_MS = 30;
-const unsigned long LONG_PRESS_MS = 1500;
-const unsigned long RATIO_AUTOSAVE_MS = 3000;
-unsigned long lastRatioAutosaveMillis = 0;
+// -----------------------------------------------------------------------------
+// Display modes
+// -----------------------------------------------------------------------------
+const uint8_t MODE_ODO = 0;
+const uint8_t MODE_TRIP = 1;
+const uint8_t MODE_MPH = 2;
+const uint8_t MODE_RATIO = 3;
+const uint8_t MODE_RPM = 4;
+const uint8_t MODE_COUNT = 5;
+uint8_t displayMode = MODE_ODO;
 
-// fram address
-const unsigned long framAddr = 0x50;
-
-// FRAM memory map
-const uint16_t TRIP_TENTHS_ADDR = 0x00;
-const uint16_t TRIP_ONES_ADDR = 0x01;
-const uint16_t TRIP_TENS_ADDR = 0x02;
-const uint16_t TRIP_HUNDREDS_ADDR = 0x03;
-
-const uint16_t ODO_TENTHS_ADDR = 0x04;
-const uint16_t ODO_ONES_ADDR = 0x05;
-const uint16_t ODO_TENS_ADDR = 0x06;
-const uint16_t ODO_HUNDREDS_ADDR = 0x07;
-const uint16_t ODO_THOUSANDS_ADDR = 0x08;
-const uint16_t ODO_TEN_THOUSANDS_ADDR = 0x09;
-const uint16_t ODO_HUNDRED_THOUSANDS_ADDR = 0x0A;
-
-// Leave space after the odometer digits. Store ratio away from odometer data to avoid overlap.
-const uint16_t RATIO_ADDR = 0x20;
-
-//----Define Stepper motor library variables and pin outs-------------------------------------------
-SwitecX25 Motor(MaxMotorSteps, 4, 5, 6, 7); // Create the motor object with the maximum steps allowed
-
-//-----------------trip----------------------
+// -----------------------------------------------------------------------------
+// Odometer/trip digit storage
+// -----------------------------------------------------------------------------
 uint8_t tripdisttenthsm = 0;
 uint8_t tripdistm = 0;
 uint8_t tripdistenm = 0;
 uint8_t tripdisthundredm = 0;
-//----------------END-trip-----------------------
 
-//------Stored Odometer Values From FRAM -----
 uint8_t disttenthsm = 0;
 uint8_t distm = 0;
 uint8_t distenm = 0;
@@ -155,313 +188,204 @@ uint8_t disthundredm = 0;
 uint8_t disthousandm = 0;
 uint8_t disttenthousandm = 0;
 uint8_t disthundredthousandm = 0;
-//------End FRAM Read-----------------------------
+
+// Function declarations
+unsigned int PulseToStep(double pulseLength);
+void loadStoredValues();
+void saveOdometerToFram();
+void saveTripToFram();
+void resetTrip();
+void loadRatioFromFram();
+void saveRatioToFram();
+float clampRatio(float value);
+void handleEncoderCalibration();
+void handleEncoderButton();
+void handleModeButton();
+void updateSpeedometer();
+void updateDistance();
+void updateodometer();
+void incrementOdometerTenth();
+void incrementTripTenth();
+float getOdometerMiles();
+float getTripMiles();
+float motorStepToMph(unsigned int stepValue);
+void displayStartupLogo();
+void displayAlignmentPattern();
+void updateDisplay();
+void drawFactoryValue(const char* label, float value, uint8_t decimals);
+void drawCalibrationDisplay();
+const __FlashStringHelper* displayModeName(uint8_t mode);
+void printStatusToSerial();
 
 void setup(void)
 {
+#if DEBUG_SERIAL
   Serial.begin(9600);
-  display.begin(); //Init OLED
+  delay(50);
+#endif
+
+  display.begin();
 
   if (fram.begin(framAddr)) {
-    Serial.println("Found I2C FRAM");
+#if DEBUG_SERIAL
+    Serial.println(F("Found I2C FRAM"));
+#endif
   } else {
-    Serial.println("I2C FRAM not identified ... check your connections?\r\n");
+#if DEBUG_SERIAL
+    Serial.println(F("I2C FRAM not identified ... check your connections?"));
+#endif
     while (1) delay(10);
   }
 
-  readOdometerFromFRAM();
-  readRatioFromFRAM();
+  pinMode(speedPulsePin, INPUT_PULLUP); // Digital pulse input; confirm FreqMeasure pin mapping for your board.
+  pinMode(calSwitchPin, INPUT_PULLUP);
+  pinMode(encoderAPin, INPUT_PULLUP);
+  pinMode(encoderBPin, INPUT_PULLUP);
+  pinMode(encoderButtonPin, INPUT_PULLUP);
+  pinMode(modeButtonPin, INPUT_PULLUP);
 
-  Serial.print("Ratio read from FRAM: ");
-  Serial.println(ratio.f, 6);
+  lastEncoderA = digitalRead(encoderAPin);
 
-  pinMode(2, INPUT_PULLUP); // Define digital pin 2 as pulse signal input. Does this need PULLUP if using VA module (internal pullup)?
+  loadStoredValues();
+  loadRatioFromFram();
 
-  pinMode(CAL_DETECT_PIN, INPUT_PULLUP);
-  pinMode(ENCODER_A_PIN, INPUT_PULLUP);
-  pinMode(ENCODER_B_PIN, INPUT_PULLUP);
-  pinMode(ENCODER_BUTTON_PIN, INPUT_PULLUP);
-  pinMode(MODE_BUTTON_PIN, INPUT_PULLUP);
-  lastEncoderA = digitalRead(ENCODER_A_PIN);
+#if DEBUG_SERIAL
+  Serial.print(F("Ratio read from FRAM: "));
+  Serial.println(ratio.f, 3);
+#endif
 
-  //-----Display logo on start-up
-  display.clearDisplay();
-  display.setFont(u8g2_font_secretaryhand_t_all);
-  display.setCursor(15, 38);
-  display.print("Savoy");
-  display.display();
-  delay(2000);
-  display.clearDisplay();
-  display.display();
-  display.setFont(u8g2_font_luBS12_tn);
-  //-----End Logo-----------------------
+  displayStartupLogo();
+#if SHOW_ALIGNMENT_ON_STARTUP
+  displayAlignmentPattern();
+  delay(3000);
+#endif
 
-  Motor.zero(); //Initialize stepper at 0 location
-  Motor.setPosition(510); //3*170 degrees, at 100mph mark
+  // Initialize stepper at 0 location, then sweep to max and back.
+  Motor.zero();
+  Motor.setPosition(MaxMotorSteps);
   Motor.updateBlocking();
   delay(1000);
-  Motor.setPosition(0);  //0MPH
+  Motor.setPosition(0);
   Motor.updateBlocking();
   delay(1000);
 
-  MinMotorStep = PulseToStep(2 * (UpdateInterval / 1000.0) * F_CPU); //Force to zero when two intervals have passed with input
+  // Force to zero when two intervals have passed with no input.
+  MinMotorStep = PulseToStep(2 * (UpdateInterval / 1000.0) * F_CPU);
 
-  FreqMeasure.begin(); // Start freqmeasure library
+  FreqMeasure.begin();
+
+  PreviousMillis = millis();
+  PreviousMillis2 = millis();
 }
 
-void loop() {
-
+void loop()
+{
   unsigned long currentMillis = millis();
 
-  calibrationMode = (digitalRead(CAL_DETECT_PIN) == LOW);
-
+  handleEncoderCalibration();
+  handleEncoderButton();
   handleModeButton();
 
-  if (calibrationMode) {
-    handleEncoderCalibration();
-  }
-
-  // Update the motor position every UpdateInterval milliseconds
+  // Update speedometer math every UpdateInterval milliseconds.
   if (currentMillis - PreviousMillis >= UpdateInterval) {
     PreviousMillis = currentMillis;
-    count = 0;
-    sum = 0;
-
-    // Read all the pulses available so we can average them
-    while (FreqMeasure.available()) {
-      sum += FreqMeasure.read();
-      count++;
-    }
-
-    if (count) {
-      // Average all the readings we got over our fixed time interval. This helps
-      // stabilize the speedo at higher speeds. The pulse length gets shorter and
-      // thus harder to measure accurately but we get more pulses to average.
-      // It may be necessary to update the FreqMeasure library to change the buffer
-      // length to hold the full number of pulses per update interval at the highest
-      // speedo values.
-      avgPulseLength = sum / count;
-
-      motorStep = (unsigned int)(PulseToStep(avgPulseLength) * ratio.f);
-      if (motorStep > MaxMotorSteps) motorStep = MaxMotorSteps;
-      noInputCount = 0;
-    }
-    else if (++noInputCount == 2) { // force speed to zero after two missed intervals
-      motorStep = 0;
-    }
-
-    // Ignore speeds below the two missed intervals speed so the motor doesn't jump
-    if (motorStep <= MinMotorStep)
-      motorStep = 0;
-
-    Motor.setPosition(motorStep);
+    updateSpeedometer();
   }
 
-  // Always update the motor. It doesn't instantly go to the desired step so even if
-  // we didn't call setPosition the motor may still be moving to position from the last
-  // setPosition call.
+  // Always update the motor. It does not instantly go to the desired step.
   Motor.update();
 
-  //-----------------Update Odometer Counter and Display every second -----------------------------------
-  unsigned long currentMillis2 = millis();
+  // Update odometer and display every second.
+  if (currentMillis - PreviousMillis2 >= UpdateInterval2) {
+    PreviousMillis2 = currentMillis;
 
-  if (currentMillis2 - PreviousMillis2 >= UpdateInterval2) {
-    PreviousMillis2 = currentMillis2;
+    updateDistance();
+    saveOdometerToFram();
+    saveTripToFram();
 
-    mph = ((motorStep / StepsPerDegree) / SpeedoDegreesPerMPH); // Might be a better way of calculating mph based on input frequency
-    Serial.print("MPH: ");
-    Serial.println(mph); // Used for testing to output speed in serial monitor.
+    if (ratioDirty && (currentMillis - lastRatioChangeMillis >= EncoderSaveIntervalMs)) {
+      saveRatioToFram();
+      ratioDirty = false;
+    }
 
-    FeetTravelled = (unsigned long)((mph * FeetPerMile) / SecondsPerHour); // Convert mph into feet per second for running subtotal count.
-    distsubtotal += FeetTravelled;  // add feet traveled to running subtotal
-    tripsubtotal += FeetTravelled;  // add feet traveled to trip running subtotal
-
-    updateodometer();      // Adds distance travelled to odometer
-    updatetripodometer();  // Adds distance travelled to trip odometer
-
-    updatefram(); // Save odometer values after the once-per-second odometer update.
-
-    autosaveRatioIfNeeded();
-    displayCurrentMode();
+    updateDisplay();
+#if DEBUG_SERIAL
+    printStatusToSerial();
+#endif
   }
-  //---------------------------END ODOMETER-------------------------------------------------------------
 }
 
-// The FreqMeasure gives us the pulse length in CPU cycles.  This formula converts this into a motor step.
-// Basically we are converting the length of the pulse in CPU cycles into pulses per second and then
-// converting that into MPH. Once we have MPH that number is converted into degrees and that is then
-// converted into a number of steps.
+void updateSpeedometer()
+{
+  count = 0;
+  sum = 0;
+
+  // Read all pulses available so we can average them. This helps stabilize
+  // the speedo at higher speeds where pulse length is shorter.
+  while (FreqMeasure.available()) {
+    sum += FreqMeasure.read();
+    count++;
+  }
+
+  if (count) {
+    avgPulseLength = sum / count;
+    motorStep = PulseToStep(avgPulseLength) * ratio.f;
+    noInputCount = 0;
+  } else if (++noInputCount == 2) {
+    motorStep = 0;
+  }
+
+  // Ignore speeds below the two-missed-intervals threshold so the motor does not jump.
+  if (motorStep <= MinMotorStep) {
+    motorStep = 0;
+  }
+
+  if (motorStep > MaxMotorSteps) {
+    motorStep = MaxMotorSteps;
+  }
+
+  mph = motorStepToMph(motorStep);
+  Motor.setPosition(motorStep);
+}
+
+// The FreqMeasure gives us the pulse length in CPU cycles. This formula converts
+// the pulse length into pulses per second, then MPH, then degrees, then motor steps.
 unsigned int PulseToStep(double pulseLength)
 {
   return (unsigned int)((F_CPU * SecondsPerHour * SpeedoDegreesPerMPH * StepsPerDegree) / (PulsesPerMile * pulseLength));
 }
 
-//-------Start of Functions-------------------------------------------------------------------------------------------------
-
-void handleEncoderCalibration() {
-  unsigned long now = millis();
-
-  int encoderA = digitalRead(ENCODER_A_PIN);
-
-  // Count on channel A falling edge. Direction comes from channel B.
-  if (encoderA != lastEncoderA && (now - lastEncoderMoveMillis) >= ENCODER_DEBOUNCE_MS) {
-    lastEncoderMoveMillis = now;
-
-    if (encoderA == LOW) {
-      int encoderB = digitalRead(ENCODER_B_PIN);
-
-      if (encoderB == HIGH) {
-        adjustRatio(RATIO_STEP);
-      } else {
-        adjustRatio(-RATIO_STEP);
-      }
-    }
-
-    lastEncoderA = encoderA;
-  }
-
-  handleEncoderButton();
+float motorStepToMph(unsigned int stepValue)
+{
+  return ((stepValue / StepsPerDegree) / SpeedoDegreesPerMPH);
 }
 
-void handleEncoderButton() {
-  unsigned long now = millis();
-  bool reading = digitalRead(ENCODER_BUTTON_PIN);
-
-  if (reading != encoderButtonLastReading) {
-    encoderButtonLastChangeMillis = now;
-  }
-
-  if ((now - encoderButtonLastChangeMillis) > BUTTON_DEBOUNCE_MS) {
-    if (reading != encoderButtonState) {
-      encoderButtonState = reading;
-
-      if (encoderButtonState == LOW) {
-        encoderButtonPressedMillis = now;
-      } else {
-        unsigned long pressTime = now - encoderButtonPressedMillis;
-
-        if (pressTime >= LONG_PRESS_MS) {
-          ratio.f = DEFAULT_RATIO;
-          ratioDirty = true;
-          saveRatioToFRAM();
-          Serial.println("Ratio reset to 1.000");
-        } else {
-          saveRatioToFRAM();
-          Serial.println("Ratio saved");
-        }
-      }
-    }
-  }
-
-  encoderButtonLastReading = reading;
+void updateDistance()
+{
+  // Convert mph into tenths of feet travelled during one second.
+  // feet/sec = mph * 5280 / 3600
+  // tenths feet/sec = feet/sec * 10
+  unsigned long feetTenthsThisSecond = (unsigned long)((mph * FeetPerMile * 10.0) / SecondsPerHour);
+  distsubtotalFeetTenths += feetTenthsThisSecond;
+  updateodometer();
 }
 
-void handleModeButton() {
-  unsigned long now = millis();
-  bool reading = digitalRead(MODE_BUTTON_PIN);
+void loadStoredValues()
+{
+  tripdisttenthsm = fram.read(ADDR_TRIP_TENTHS);
+  tripdistm = fram.read(ADDR_TRIP_ONES);
+  tripdistenm = fram.read(ADDR_TRIP_TENS);
+  tripdisthundredm = fram.read(ADDR_TRIP_HUNDREDS);
 
-  if (reading != modeButtonLastReading) {
-    modeButtonLastChangeMillis = now;
-  }
+  disttenthsm = fram.read(ADDR_ODO_TENTHS);
+  distm = fram.read(ADDR_ODO_ONES);
+  distenm = fram.read(ADDR_ODO_TENS);
+  disthundredm = fram.read(ADDR_ODO_HUNDREDS);
+  disthousandm = fram.read(ADDR_ODO_THOUSANDS);
+  disttenthousandm = fram.read(ADDR_ODO_TEN_THOUSANDS);
+  disthundredthousandm = fram.read(ADDR_ODO_HUNDRED_THOUSANDS);
 
-  if ((now - modeButtonLastChangeMillis) > BUTTON_DEBOUNCE_MS) {
-    if (reading != modeButtonState) {
-      modeButtonState = reading;
-
-      if (modeButtonState == LOW) {
-        modeButtonPressedMillis = now;
-        modeButtonLongPressHandled = false;
-      } else {
-        unsigned long pressTime = now - modeButtonPressedMillis;
-
-        // Short press cycles modes. Long press in trip mode is handled while held.
-        if (pressTime < LONG_PRESS_MS && !modeButtonLongPressHandled) {
-          cycleDisplayMode();
-        }
-      }
-    }
-
-    // Long press resets the trip odometer only when the trip screen is active.
-    if (modeButtonState == LOW && !modeButtonLongPressHandled && displayMode == MODE_TRIP && (now - modeButtonPressedMillis >= LONG_PRESS_MS)) {
-      resetTripOdometer();
-      modeButtonLongPressHandled = true;
-      displayTripResetMessage();
-      Serial.println("Trip odometer reset");
-    }
-  }
-
-  modeButtonLastReading = reading;
-}
-
-void cycleDisplayMode() {
-  displayMode = (DisplayMode)((displayMode + 1) % MODE_COUNT);
-
-  Serial.print("Display mode: ");
-  Serial.println((int)displayMode);
-
-  displayCurrentMode();
-}
-
-void adjustRatio(float adjustment) {
-  ratio.f += adjustment;
-
-  if (ratio.f < MIN_RATIO) ratio.f = MIN_RATIO;
-  if (ratio.f > MAX_RATIO) ratio.f = MAX_RATIO;
-
-  ratioDirty = true;
-
-  Serial.print("Ratio adjusted: ");
-  Serial.println(ratio.f, 6);
-}
-
-void autosaveRatioIfNeeded() {
-  unsigned long now = millis();
-
-  if (ratioDirty && calibrationMode && (now - lastRatioAutosaveMillis >= RATIO_AUTOSAVE_MS)) {
-    saveRatioToFRAM();
-    lastRatioAutosaveMillis = now;
-  }
-}
-
-void readRatioFromFRAM() {
-  ratio.b[0] = fram.read(RATIO_ADDR + 0);
-  ratio.b[1] = fram.read(RATIO_ADDR + 1);
-  ratio.b[2] = fram.read(RATIO_ADDR + 2);
-  ratio.b[3] = fram.read(RATIO_ADDR + 3);
-
-  // If FRAM is blank/corrupt or ratio is outside a sane range, start at 1:1.
-  if (isnan(ratio.f) || ratio.f < MIN_RATIO || ratio.f > MAX_RATIO) {
-    ratio.f = DEFAULT_RATIO;
-    saveRatioToFRAM();
-  }
-}
-
-void saveRatioToFRAM() {
-  fram.write(RATIO_ADDR + 0, ratio.b[0]);
-  fram.write(RATIO_ADDR + 1, ratio.b[1]);
-  fram.write(RATIO_ADDR + 2, ratio.b[2]);
-  fram.write(RATIO_ADDR + 3, ratio.b[3]);
-  ratioDirty = false;
-}
-
-void readOdometerFromFRAM() {
-  tripdisttenthsm = fram.read(TRIP_TENTHS_ADDR);
-  tripdistm = fram.read(TRIP_ONES_ADDR);
-  tripdistenm = fram.read(TRIP_TENS_ADDR);
-  tripdisthundredm = fram.read(TRIP_HUNDREDS_ADDR);
-
-  disttenthsm = fram.read(ODO_TENTHS_ADDR);
-  distm = fram.read(ODO_ONES_ADDR);
-  distenm = fram.read(ODO_TENS_ADDR);
-  disthundredm = fram.read(ODO_HUNDREDS_ADDR);
-  disthousandm = fram.read(ODO_THOUSANDS_ADDR);
-  disttenthousandm = fram.read(ODO_TEN_THOUSANDS_ADDR);
-  disthundredthousandm = fram.read(ODO_HUNDRED_THOUSANDS_ADDR);
-
-  sanitizeOdometerDigits();
-}
-
-void sanitizeOdometerDigits() {
+  // Sanity-check BCD-style digit storage.
   if (tripdisttenthsm > 9) tripdisttenthsm = 0;
   if (tripdistm > 9) tripdistm = 0;
   if (tripdistenm > 9) tripdistenm = 0;
@@ -476,161 +400,196 @@ void sanitizeOdometerDigits() {
   if (disthundredthousandm > 9) disthundredthousandm = 0;
 }
 
-void displayCurrentMode() {
-  switch (displayMode) {
-    case MODE_ODOMETER:
-      displayodometer();
-      break;
+void saveOdometerToFram()
+{
+  fram.write(ADDR_ODO_TENTHS, disttenthsm);
+  fram.write(ADDR_ODO_ONES, distm);
+  fram.write(ADDR_ODO_TENS, distenm);
+  fram.write(ADDR_ODO_HUNDREDS, disthundredm);
+  fram.write(ADDR_ODO_THOUSANDS, disthousandm);
+  fram.write(ADDR_ODO_TEN_THOUSANDS, disttenthousandm);
+  fram.write(ADDR_ODO_HUNDRED_THOUSANDS, disthundredthousandm);
+}
 
-    case MODE_TRIP:
-      displaytripodometer();
-      break;
+void saveTripToFram()
+{
+  fram.write(ADDR_TRIP_TENTHS, tripdisttenthsm);
+  fram.write(ADDR_TRIP_ONES, tripdistm);
+  fram.write(ADDR_TRIP_TENS, tripdistenm);
+  fram.write(ADDR_TRIP_HUNDREDS, tripdisthundredm);
+}
 
-    case MODE_RATIO:
-      displayRatio();
-      break;
+void resetTrip()
+{
+  tripdisttenthsm = 0;
+  tripdistm = 0;
+  tripdistenm = 0;
+  tripdisthundredm = 0;
+  saveTripToFram();
+#if DEBUG_SERIAL
+  Serial.println(F("Trip reset to 0.0"));
+#endif
+  updateDisplay();
+}
 
-    case MODE_RPM:
-      displayRpmPlaceholder();
-      break;
+void loadRatioFromFram()
+{
+  ratio.b[0] = fram.read(ADDR_RATIO + 0);
+  ratio.b[1] = fram.read(ADDR_RATIO + 1);
+  ratio.b[2] = fram.read(ADDR_RATIO + 2);
+  ratio.b[3] = fram.read(ADDR_RATIO + 3);
+
+  if (isnan(ratio.f) || ratio.f < MinRatio || ratio.f > MaxRatio) {
+    ratio.f = DefaultRatio;
+    saveRatioToFram();
   }
 }
 
-void displayRatio() {
-  display.clearDisplay();
-  display.setFont(u8g2_font_luBS12_tn);
+void saveRatioToFram()
+{
+  ratio.f = clampRatio(ratio.f);
+  fram.write(ADDR_RATIO + 0, ratio.b[0]);
+  fram.write(ADDR_RATIO + 1, ratio.b[1]);
+  fram.write(ADDR_RATIO + 2, ratio.b[2]);
+  fram.write(ADDR_RATIO + 3, ratio.b[3]);
+#if DEBUG_SERIAL
+  Serial.print(F("Ratio saved: "));
+  Serial.println(ratio.f, 3);
+#endif
+}
 
-  display.setCursor(5, 18);
-  if (calibrationMode) {
-    display.print("CAL RATIO");
-  } else {
-    display.print("RATIO");
+float clampRatio(float value)
+{
+  if (value < MinRatio) return MinRatio;
+  if (value > MaxRatio) return MaxRatio;
+  return value;
+}
+
+void handleEncoderCalibration()
+{
+  // Calibration mode only active when harness grounds A0/D14.
+  bool calMode = (digitalRead(calSwitchPin) == LOW);
+  if (!calMode) {
+    lastEncoderA = digitalRead(encoderAPin);
+    return;
   }
 
-  display.setCursor(5, 42);
-  display.print(ratio.f, 3);
+  int encoderA = digitalRead(encoderAPin);
+  if (encoderA != lastEncoderA) {
+    // Read on A rising edge to get one count per detent-ish.
+    if (encoderA == HIGH) {
+      int encoderB = digitalRead(encoderBPin);
 
-  display.setCursor(5, 62);
-  display.print("MPH ");
-  display.print(mph, 1);
+      if (encoderB == LOW) {
+        ratio.f += RatioStep;
+      } else {
+        ratio.f -= RatioStep;
+      }
 
-  display.display();
+      ratio.f = clampRatio(ratio.f);
+      lastRatioChangeMillis = millis();
+      ratioDirty = true;
+
+#if DEBUG_SERIAL
+      Serial.print(F("Ratio adjusted: "));
+      Serial.println(ratio.f, 3);
+#endif
+      updateDisplay();
+    }
+    lastEncoderA = encoderA;
+  }
 }
 
-void displayRpmPlaceholder() {
-  display.clearDisplay();
-  display.setFont(u8g2_font_luBS12_tn);
+void handleEncoderButton()
+{
+  bool reading = digitalRead(encoderButtonPin);
+  unsigned long now = millis();
 
-  display.setCursor(5, 20);
-  display.print("RPM");
+  if (reading != encButtonLastReading) {
+    encButtonLastChange = now;
+    encButtonLastReading = reading;
+  }
 
-  display.setCursor(5, 46);
-  display.print("Future");
+  if ((now - encButtonLastChange) > DebounceMs && reading != encButtonStableState) {
+    encButtonStableState = reading;
 
-  display.display();
+    if (encButtonStableState == LOW) {
+      encButtonPressedAt = now;
+      encLongPressHandled = false;
+    } else {
+      if (!encLongPressHandled) {
+        // Short press: save ratio.
+        saveRatioToFram();
+        ratioDirty = false;
+      }
+    }
+  }
+
+  if (encButtonStableState == LOW && !encLongPressHandled && (now - encButtonPressedAt >= LongPressMs)) {
+    // Long press: reset ratio to 1.000.
+    ratio.f = DefaultRatio;
+    saveRatioToFram();
+    ratioDirty = false;
+    encLongPressHandled = true;
+#if DEBUG_SERIAL
+    Serial.println(F("Ratio reset to 1.000"));
+#endif
+    updateDisplay();
+  }
 }
 
-void displayTripResetMessage() {
-  display.clearDisplay();
-  display.setFont(u8g2_font_luBS12_tn);
+void handleModeButton()
+{
+  bool reading = digitalRead(modeButtonPin);
+  unsigned long now = millis();
 
-  display.setCursor(5, 24);
-  display.print("TRIP");
+  if (reading != modeButtonLastReading) {
+    modeButtonLastChange = now;
+    modeButtonLastReading = reading;
+  }
 
-  display.setCursor(5, 50);
-  display.print("RESET");
+  if ((now - modeButtonLastChange) > DebounceMs && reading != modeButtonStableState) {
+    modeButtonStableState = reading;
 
-  display.display();
-}
+    if (modeButtonStableState == LOW) {
+      modeButtonPressedAt = now;
+      modeLongPressHandled = false;
+    } else {
+      if (!modeLongPressHandled) {
+        // Short press: cycle display modes.
+        displayMode = (displayMode + 1) % MODE_COUNT;
+#if DEBUG_SERIAL
+        Serial.print(F("Mode: "));
+        Serial.println(displayModeName(displayMode));
+#endif
+        updateDisplay();
+      }
+    }
+  }
 
-void displayodometer() {
-
-  //display.setTextSize(3)
-  //display.setTextColor(WHITE);
-  display.clearDisplay();
-  display.setFont(u8g2_font_luBS12_tn);
-
-  display.setCursor(5, 16);
-  display.print("ODO");
-
-  //----------------Display hundred thousand m units------------------------------------
-  display.setCursor(5, 46);
-  display.println(disthundredthousandm);
-
-  //----------------Display ten thousand m units------------------------------------
-  display.setCursor(25, 46);
-  display.println(disttenthousandm);
-
-  //----------------Display thousand m units------------------------------------
-  display.setCursor(45, 46);
-  display.println(disthousandm);
-
-  //----------------Display hundreds m units------------------------------------
-  display.setCursor(65, 46);
-  display.println(disthundredm);
-
-  //----------------Display tens m units----------------------------------------
-  display.setCursor(85, 46);
-  display.println(distenm);
-
-  //----------------Display miles units---------------------------------------------
-  display.setCursor(105, 46);
-  display.println(distm);
-
-  //----------------Display tenths m units---------------------------------------------
-  display.setCursor(130, 46);
-
-  //set reverse video mode
-  display.sendF("c", 0x0a1);
-
-  display.println(disttenthsm);
-  display.display();
-
-  //set normal mode
-  display.sendF("c", 0x0a6);
-}
-
-void displaytripodometer() {
-
-  display.clearDisplay();
-  display.setFont(u8g2_font_luBS12_tn);
-
-  display.setCursor(5, 16);
-  display.print("TRIP");
-
-  //----------------Display hundreds m units------------------------------------
-  display.setCursor(5, 46);
-  display.println(tripdisthundredm);
-
-  //----------------Display tens m units----------------------------------------
-  display.setCursor(25, 46);
-  display.println(tripdistenm);
-
-  //----------------Display miles units---------------------------------------------
-  display.setCursor(45, 46);
-  display.println(tripdistm);
-
-  //----------------Display tenths m units---------------------------------------------
-  display.setCursor(70, 46);
-
-  //set reverse video mode
-  display.sendF("c", 0x0a1);
-
-  display.println(tripdisttenthsm);
-  display.display();
-
-  //set normal mode
-  display.sendF("c", 0x0a6);
+  if (modeButtonStableState == LOW && !modeLongPressHandled && (now - modeButtonPressedAt >= LongPressMs)) {
+    // Long press in TRIP mode: reset trip.
+    if (displayMode == MODE_TRIP) {
+      resetTrip();
+    }
+    modeLongPressHandled = true;
+  }
 }
 
 //-------------------------Update Odometer Counts--------------------------------------------------------
-
-void updateodometer() {
-
-  while (distsubtotal >= 528) {
-    ++disttenthsm;
-    distsubtotal -= 528;
+void updateodometer()
+{
+  // 0.1 mile = 528 feet = 5280 tenths of a foot.
+  while (distsubtotalFeetTenths >= 5280UL) {
+    incrementOdometerTenth();
+    incrementTripTenth();
+    distsubtotalFeetTenths -= 5280UL;
   }
+}
+
+void incrementOdometerTenth()
+{
+  ++disttenthsm;
 
   if (disttenthsm > 9) {
     ++distm;
@@ -661,14 +620,15 @@ void updateodometer() {
     ++disthundredthousandm;
     disttenthousandm = 0;
   }
+
+  if (disthundredthousandm > 9) {
+    disthundredthousandm = 0;
+  }
 }
 
-void updatetripodometer() {
-
-  while (tripsubtotal >= 528) {
-    ++tripdisttenthsm;
-    tripsubtotal -= 528;
-  }
+void incrementTripTenth()
+{
+  ++tripdisttenthsm;
 
   if (tripdisttenthsm > 9) {
     ++tripdistm;
@@ -686,31 +646,150 @@ void updatetripodometer() {
   }
 
   if (tripdisthundredm > 9) {
-    // Trip display is limited to 999.9 miles. Roll over after that.
     tripdisthundredm = 0;
   }
 }
 
-void resetTripOdometer() {
-  tripdisttenthsm = 0;
-  tripdistm = 0;
-  tripdistenm = 0;
-  tripdisthundredm = 0;
-  tripsubtotal = 0;
-  updatefram();
+float getOdometerMiles()
+{
+  unsigned long wholeMiles = 0;
+  wholeMiles += (unsigned long)disthundredthousandm * 100000UL;
+  wholeMiles += (unsigned long)disttenthousandm * 10000UL;
+  wholeMiles += (unsigned long)disthousandm * 1000UL;
+  wholeMiles += (unsigned long)disthundredm * 100UL;
+  wholeMiles += (unsigned long)distenm * 10UL;
+  wholeMiles += (unsigned long)distm;
+  return wholeMiles + (disttenthsm / 10.0);
 }
 
-void updatefram() {
+float getTripMiles()
+{
+  unsigned long wholeMiles = 0;
+  wholeMiles += (unsigned long)tripdisthundredm * 100UL;
+  wholeMiles += (unsigned long)tripdistenm * 10UL;
+  wholeMiles += (unsigned long)tripdistm;
+  return wholeMiles + (tripdisttenthsm / 10.0);
+}
 
-  fram.write(TRIP_TENTHS_ADDR, tripdisttenthsm);
-  fram.write(TRIP_ONES_ADDR, tripdistm);
-  fram.write(TRIP_TENS_ADDR, tripdistenm);
-  fram.write(TRIP_HUNDREDS_ADDR, tripdisthundredm);
-  fram.write(ODO_TENTHS_ADDR, disttenthsm);
-  fram.write(ODO_ONES_ADDR, distm);
-  fram.write(ODO_TENS_ADDR, distenm);
-  fram.write(ODO_HUNDREDS_ADDR, disthundredm);
-  fram.write(ODO_THOUSANDS_ADDR, disthousandm);
-  fram.write(ODO_TEN_THOUSANDS_ADDR, disttenthousandm);
-  fram.write(ODO_HUNDRED_THOUSANDS_ADDR, disthundredthousandm);
+void displayStartupLogo()
+{
+  display.clearDisplay();
+  display.setFont(u8g2_font_secretaryhand_t_all);
+  display.setCursor(15, 38);
+  display.print(F("Savoy"));
+  display.display();
+  delay(2000);
+  display.clearDisplay();
+  display.display();
+}
+
+void displayAlignmentPattern()
+{
+  display.clearDisplay();
+  display.setFont(u8g2_font_luBS12_tn);
+  display.setCursor(VIEW_X, VIEW_Y);
+  display.print(F("88888.8"));
+  display.display();
+}
+
+void updateDisplay()
+{
+  bool calMode = (digitalRead(calSwitchPin) == LOW);
+
+  display.clearDisplay();
+
+  if (calMode) {
+    drawCalibrationDisplay();
+    display.display();
+    return;
+  }
+
+  switch (displayMode) {
+    case MODE_ODO:
+      drawFactoryValue("ODO", getOdometerMiles(), 1);
+      break;
+    case MODE_TRIP:
+      drawFactoryValue("TRIP", getTripMiles(), 1);
+      break;
+    case MODE_MPH:
+      drawFactoryValue("MPH", mph, 1);
+      break;
+    case MODE_RATIO:
+      drawFactoryValue("RATIO", ratio.f, 3);
+      break;
+    case MODE_RPM:
+      drawFactoryValue("RPM", rpm, 0);
+      break;
+    default:
+      drawFactoryValue("ODO", getOdometerMiles(), 1);
+      break;
+  }
+
+  display.display();
+}
+
+void drawFactoryValue(const char* label, float value, uint8_t decimals)
+{
+  // Keep the main value inside the factory odometer-window viewport.
+  // The label is small and can be disabled later if the window is too tight.
+  display.setFont(u8g2_font_5x7_tr);
+  display.setCursor(VIEW_X, max(7, VIEW_Y - 18));
+  display.print(label);
+
+  display.setFont(u8g2_font_luBS12_tn);
+  display.setCursor(VIEW_X, VIEW_Y);
+  display.print(value, decimals);
+}
+
+void drawCalibrationDisplay()
+{
+  // Calibration harness overrides the selected mode.
+  // Use compact text so both MPH and ratio fit through the odometer window.
+  display.setFont(u8g2_font_5x7_tr);
+  display.setCursor(VIEW_X, max(7, VIEW_Y - 26));
+  display.print(F("CAL"));
+
+  display.setCursor(VIEW_X, max(15, VIEW_Y - 15));
+  display.print(F("MPH "));
+  display.print(mph, 1);
+
+  display.setCursor(VIEW_X, VIEW_Y);
+  display.print(F("RATIO "));
+  display.print(ratio.f, 3);
+}
+
+const __FlashStringHelper* displayModeName(uint8_t mode)
+{
+  switch (mode) {
+    case MODE_ODO:
+      return F("ODO");
+    case MODE_TRIP:
+      return F("TRIP");
+    case MODE_MPH:
+      return F("MPH");
+    case MODE_RATIO:
+      return F("RATIO");
+    case MODE_RPM:
+      return F("RPM");
+    default:
+      return F("?");
+  }
+}
+
+void printStatusToSerial()
+{
+  Serial.print(F("MPH="));
+  Serial.print(mph, 1);
+  Serial.print(F("  Step="));
+  Serial.print(motorStep);
+  Serial.print(F("  ODO="));
+  Serial.print(getOdometerMiles(), 1);
+  Serial.print(F("  TRIP="));
+  Serial.print(getTripMiles(), 1);
+  Serial.print(F("  Ratio="));
+  Serial.print(ratio.f, 3);
+  Serial.print(F("  Mode="));
+  Serial.print(displayModeName(displayMode));
+  Serial.print(F("  Cal="));
+  Serial.println(digitalRead(calSwitchPin) == LOW ? F("YES") : F("NO"));
 }
