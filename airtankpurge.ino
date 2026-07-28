@@ -1,8 +1,8 @@
 // Project: Compressor Auto Purge Controller
 // Author: Robert Cipriani
-// Last Updated: 2026-06-04
+// Last Updated: 2026-07-28
 //
-// v1.1.0
+// v1.1.1
 //
 // Hardware:
 // - Arduino UNO
@@ -37,6 +37,7 @@
 // v1.0.0 Initial release
 // v1.0.5 Debounced manual purge button
 // v1.1.0 Non-blocking state machine and status LED support
+// v1.1.1 Ignore button during startup test; single-point 24-hour timer reset in startPurge()
 
 const byte RELAY_PIN = 7;
 const byte BUTTON_PIN = 8;
@@ -46,6 +47,7 @@ const unsigned long HOURS_TO_MS = 3600000UL;          // conversion factor: hour
 const unsigned long INTERVAL_MS = 24UL * HOURS_TO_MS; // 24-hour interval between automatic purges
 const unsigned long PURGE_TIME_MS = 5000UL;           // purge duration: 5 seconds
 const unsigned long DEBOUNCE_MS = 50UL;               // button debounce time
+const unsigned long STARTUP_TEST_MS = 1000UL;         // startup functional test duration: 1 second
 
 const unsigned long LED_NORMAL_INTERVAL = 1000UL;     // slow blink while running
 const unsigned long LED_PURGE_INTERVAL = 125UL;       // fast blink while purging
@@ -99,7 +101,7 @@ void loop()
 
     if (startupTestActive)
     {
-        if (currentMillis - startupTestStartMillis >= 1000UL)
+        if (currentMillis - startupTestStartMillis >= STARTUP_TEST_MS)
         {
             digitalWrite(RELAY_PIN, LOW);
 
@@ -126,29 +128,31 @@ void loop()
     // Manual Button Handling with Debounce
     //--------------------------------------
 
-    bool reading = digitalRead(BUTTON_PIN);
-
-    // Detect state change
-    if (reading != lastButtonReading)
+    // Ignore the button until the startup test has finished, so a press
+    // held at power-up cannot start a purge that the startup test then cuts short
+    if (!startupTestActive)
     {
-        lastButtonChangeMillis = currentMillis;
-        lastButtonReading = reading;
-    }
+        bool reading = digitalRead(BUTTON_PIN);
 
-    // If stable longer than debounce period
-    if ((currentMillis - lastButtonChangeMillis) >= DEBOUNCE_MS)
-    {
-        if (reading != stableButtonState)
+        // Detect state change
+        if (reading != lastButtonReading)
         {
-            stableButtonState = reading;
+            lastButtonChangeMillis = currentMillis;
+            lastButtonReading = reading;
+        }
 
-            // Trigger once when button is pressed
-            if (stableButtonState == LOW)
+        // If stable longer than debounce period
+        if ((currentMillis - lastButtonChangeMillis) >= DEBOUNCE_MS)
+        {
+            if (reading != stableButtonState)
             {
-                startPurge(currentMillis);
+                stableButtonState = reading;
 
-                // Restart 24-hour timer from manual purge
-                previousPurgeMillis = currentMillis;
+                // Trigger once when button is pressed
+                if (stableButtonState == LOW)
+                {
+                    startPurge(currentMillis);
+                }
             }
         }
     }
@@ -164,9 +168,6 @@ void loop()
             digitalWrite(RELAY_PIN, LOW);
 
             purgeActive = false;
-
-            // Automatic purge also resets the timer
-            previousPurgeMillis = currentMillis;
         }
     }
 
@@ -197,6 +198,9 @@ void startPurge(unsigned long currentMillis)
 
     purgeActive = true;
     purgeStartMillis = currentMillis;
+
+    // Any purge (automatic or manual) restarts the 24-hour interval
+    previousPurgeMillis = currentMillis;
 
     digitalWrite(RELAY_PIN, HIGH);
 }
