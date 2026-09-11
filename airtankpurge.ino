@@ -1,8 +1,8 @@
 // Project: Compressor Auto Purge Controller
 // Author: Robert Cipriani
-// Last Updated: 2026-07-28
+// Last Updated: 2026-09-10
 //
-// v1.1.1
+// v1.3.0
 //
 // Hardware:
 // - Arduino UNO
@@ -38,6 +38,9 @@
 // v1.0.5 Debounced manual purge button
 // v1.1.0 Non-blocking state machine and status LED support
 // v1.1.1 Ignore button during startup test; single-point 24-hour timer reset in startPurge()
+
+// v1.3.0 Supervisory telemetry; remote purge remains disabled.
+#include "purge_telemetry/UnoTelemetry.h"
 
 const byte RELAY_PIN = 7;
 const byte BUTTON_PIN = 8;
@@ -85,6 +88,7 @@ void setup()
     // This intentionally occurs on every power-up/reset
     // and resets the 24-hour purge schedule
 
+    espLink.begin(9600);
     digitalWrite(RELAY_PIN, HIGH);
 
     startupTestActive = true;
@@ -106,6 +110,7 @@ void loop()
             digitalWrite(RELAY_PIN, LOW);
 
             startupTestActive = false;
+            statusRequested = true;
 
             // Start 24-hour timer after startup test
             previousPurgeMillis = currentMillis;
@@ -168,6 +173,7 @@ void loop()
             digitalWrite(RELAY_PIN, LOW);
 
             purgeActive = false;
+            recordPurgeComplete(currentMillis - purgeStartMillis);
         }
     }
 
@@ -186,6 +192,9 @@ void loop()
 
         digitalWrite(LED_PIN, ledState);
     }
+    serviceTelemetry(millis(), startupTestActive, purgeActive,
+                     startupTestActive ? startupTestStartMillis : purgeStartMillis,
+                     startupTestActive ? STARTUP_TEST_MS : PURGE_TIME_MS);
 }
 
 void startPurge(unsigned long currentMillis)
@@ -196,6 +205,7 @@ void startPurge(unsigned long currentMillis)
         return;
     }
 
+    statusRequested = true;
     purgeActive = true;
     purgeStartMillis = currentMillis;
 
